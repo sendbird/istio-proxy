@@ -2,45 +2,45 @@ version: 2.1
 
 orbs:
   aws-ecr: circleci/aws-ecr@8.1.3
-  aws-cli: circleci/aws-cli@2.0.6
+  aws-cli: circleci/aws-cli@5.1.1
 
 workflows:
   build:
     jobs:
-      - build:
-          name: build_arm64
-          filters:
-            tags:
-              only:
-                - /^v.*/
-            branches:
-              ignore:
-                - /.*/
-          context: circleci-soda-bot
-          machine-type: arm64
-      - build:
-          name: build_x64
-          filters:
-            tags:
-              only:
-                - /^v.*/
-            branches:
-              ignore:
-                - /.*/
-          context: circleci-soda-bot
-          machine-type: amd64
-      - merge_docker:
-          filters:
-            tags:
-              only:
-                - /^v.*/
-            branches:
-              ignore:
-                - /.*/
-          context: circleci-soda-bot
-          requires:
-            - build_arm64
-            - build_x64
+    - build:
+        name: build_arm64
+        filters:
+          tags:
+            only:
+            - /^v.*/
+          branches:
+            ignore:
+            - /.*/
+        context: circleci-soda-bot
+        machine-type: arm64
+    - build:
+        name: build_x64
+        filters:
+          tags:
+            only:
+            - /^v.*/
+          branches:
+            ignore:
+            - /.*/
+        context: circleci-soda-bot
+        machine-type: amd64
+    - merge_docker:
+        filters:
+          tags:
+            only:
+            - /^v.*/
+          branches:
+            ignore:
+            - /.*/
+        context: circleci-soda-bot
+        requires:
+        - build_arm64
+        - build_x64
 
 executors:
   arm64:
@@ -60,85 +60,94 @@ jobs:
     executor: << parameters.machine-type >>
 
     steps:
-      - checkout
-      - aws-cli/setup:
-          aws-access-key-id: AWS_ACCESS_KEY_ID
-          aws-secret-access-key: AWS_SECRET_ACCESS_KEY
-          profile-name: default
-          configure-default-region: false
-      - run:
-          name: Set environment
-          command: |
-            echo 'export AWS_REGION=us-east-1' >> $BASH_ENV
-            echo 'export AWS_ROLE_ARN=$AWS_ROLE_CI_OPS' >> $BASH_ENV
-            echo 'export ECR_ACCOUNT_NUM=$(echo $AWS_ROLE_CI_OPS | grep -Eo "[0-9]{12}")' >> $BASH_ENV
-            echo 'export ECR_HOST=${ECR_ACCOUNT_NUM}.dkr.ecr.${AWS_REGION}.amazonaws.com' >> $BASH_ENV
-            echo 'export REPOSITORY=mesg/istio/proxyv2' >> $BASH_ENV
-            echo 'export URI=$ECR_HOST/$REPOSITORY:$CIRCLE_TAG' >> $BASH_ENV
-            if  [ "$(uname -m)" = "x86_64" ]; then
-              ARCH=amd64
-            else
-              ARCH=arm64
-            fi
-            echo "export ARCH=$ARCH" >> $BASH_ENV
-      - run:
-          name: Set AWS credentials
-          command: |
-            mkdir -p ~/.aws
-            echo '
-            [profile circleci]
-            source_profile=default
-            role_arn='"$AWS_ROLE_CI_OPS"'
-            ' >> ~/.aws/config
-      - run:
-          name: build
-          command: |
-            BUILD_WITH_CONTAINER=1 make build_envoy
-      - run:
-          name: Extract build output
-          command: |
-            common/scripts/run.sh cp /work/bazel-bin/envoy .
-            mkdir $ARCH
-            cp envoy $ARCH/
+    - aws-setup
+    - checkout
+    - run:
+        name: Set environment
+        command: |
+          echo 'export REPOSITORY=mesg/istio/proxyv2' >> $BASH_ENV
+          echo 'export URI=$ECR_HOST/$REPOSITORY:$CIRCLE_TAG' >> $BASH_ENV
+          if  [ "$(uname -m)" = "x86_64" ]; then
+            ARCH=amd64
+          else
+            ARCH=arm64
+          fi
+          echo "export ARCH=$ARCH" >> $BASH_ENV
+    - run:
+        name: build
+        command: |
+          BUILD_WITH_CONTAINER=1 make build_envoy
+    - run:
+        name: Extract build output
+        command: |
+          common/scripts/run.sh cp /work/bazel-bin/envoy .
+          mkdir $ARCH
+          cp envoy $ARCH/
 
-            aws ecr get-login-password --region $AWS_REGION --profile circleci | docker login --username AWS --password-stdin $ECR_HOST
-            docker build -t "$URI-$ARCH" .
-            docker push "$URI-$ARCH"
-      - store_artifacts:
-          path: envoy
+          docker build -t "$URI-$ARCH" .
+          docker push "$URI-$ARCH"
+    - store_artifacts:
+        path: envoy
   merge_docker:
     machine:
       image: ubuntu-2204:current
     steps:
-      - checkout
-      - aws-cli/setup:
-          aws-access-key-id: AWS_ACCESS_KEY_ID
-          aws-secret-access-key: AWS_SECRET_ACCESS_KEY
-          profile-name: default
-          configure-default-region: false
-      - run:
-          name: Set environment
-          command: |
-            echo 'export AWS_REGION=us-east-1' >> $BASH_ENV
-            echo 'export AWS_ROLE_ARN=$AWS_ROLE_CI_OPS' >> $BASH_ENV
-            echo 'export ECR_ACCOUNT_NUM=$(echo $AWS_ROLE_CI_OPS | grep -Eo "[0-9]{12}")' >> $BASH_ENV
-            echo 'export ECR_HOST=${ECR_ACCOUNT_NUM}.dkr.ecr.${AWS_REGION}.amazonaws.com' >> $BASH_ENV
-            echo 'export REPOSITORY=mesg/istio/proxyv2' >> $BASH_ENV
-            echo 'export URI=$ECR_HOST/$REPOSITORY:$CIRCLE_TAG' >> $BASH_ENV
-      - run:
-          name: Set AWS credentials
-          command: |
-            mkdir -p ~/.aws
-            echo '
-            [profile circleci]
-            source_profile=default
-            role_arn='"$AWS_ROLE_CI_OPS"'
-            ' >> ~/.aws/config
-      - run:
-          name: Build docker image
-          command: |
-            aws ecr get-login-password --region $AWS_REGION --profile circleci | docker login --username AWS --password-stdin $ECR_HOST
-            docker pull $URI-amd64
-            docker pull $URI-arm64
-            docker manifest create $URI $URI-amd64 $URI-arm64
-            docker manifest push $URI
+    - aws-setup
+    - checkout
+    - run:
+        name: Set environment
+        command: |
+          echo 'export REPOSITORY=mesg/istio/proxyv2' >> $BASH_ENV
+          echo 'export URI=$ECR_HOST/$REPOSITORY:$CIRCLE_TAG' >> $BASH_ENV
+    - run:
+        name: Build docker image
+        command: |
+          docker pull $URI-amd64
+          docker pull $URI-arm64
+          docker manifest create $URI $URI-amd64 $URI-arm64
+          docker manifest push $URI
+
+commands:
+  aws-setup:
+    steps:
+    - run:
+        name: Install aws-ecr-credential-helper
+        command: |
+          if [ -n "$(which docker-credential-ecr-login)" ]; then
+            echo "aws-ecr-credential-helper already installed"
+          else
+            sudo apt update && sudo apt install amazon-ecr-credential-helper -y
+          fi
+          mkdir -p ~/.docker
+          echo '{ "credsStore": "ecr-login" }' > ~/.docker/config.json
+    - run:
+        name: Setup AWS credentials
+        command: |
+          # remove existing credentials
+          unset AWS_ACCESS_KEY_ID
+          unset AWS_SECRET_ACCESS_KEY
+          unset AWS_SESSION_TOKEN
+          unset AWS_ROLE_ARN
+          rm -rf ~/.aws/credentials
+
+          # assume role with oidc token
+          echo ${CIRCLE_OIDC_TOKEN} > /tmp/token
+          export AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/token
+          export AWS_ROLE_ARN=${AWS_ID_ROLE_ARN}
+          export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s" \
+          $(aws sts assume-role \
+          --role-arn ${AWS_OPS_ROLE_ARN} \
+          --role-session-name ${CIRCLE_JOB} \
+          --duration-seconds 7200 \
+          --query "Credentials.[AccessKeyId,SecretAccessKey,SessionToken]" \
+          --output text))
+
+          # set aws credentials
+          echo "export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" >> $BASH_ENV
+          echo "export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" >> $BASH_ENV
+          echo "export AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}" >> $BASH_ENV
+
+          # set ecr host
+          echo 'export AWS_REGION=us-east-1' >> $BASH_ENV
+          echo 'export ECR_ACCOUNT_NUM=$(echo ${AWS_OPS_ROLE_ARN} | grep -Eo "[0-9]{12}")' >> $BASH_ENV
+          echo 'export ECR_HOST=${ECR_ACCOUNT_NUM}.dkr.ecr.${AWS_REGION}.amazonaws.com' >> $BASH_ENV
