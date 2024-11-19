@@ -61,10 +61,6 @@ jobs:
 
     steps:
     - checkout
-    - run:
-        name: build
-        command: |
-          BUILD_WITH_CONTAINER=1 make build_envoy
     - aws-setup
     - run:
         name: Set environment
@@ -78,14 +74,32 @@ jobs:
           fi
           echo "export ARCH=$ARCH" >> $BASH_ENV
     - run:
+        name: build
+        command: |
+          set +e
+          docker manifest inspect $URI-$ARCH > /dev/null
+          if [ $? -eq 0 ]; then
+            echo "ECR already has an image for $URI. Skipping build since registry is immutable."
+            circleci-agent step halt
+          else
+            BUILD_WITH_CONTAINER=1 make build_envoy
+          fi
+    - run:
         name: Extract build output
         command: |
           common/scripts/run.sh cp /work/bazel-bin/envoy .
           mkdir $ARCH
           cp envoy $ARCH/
 
-          docker build -t "$URI-$ARCH" .
-          docker push "$URI-$ARCH"
+          docker build -t $URI-$ARCH .
+    - run:
+        name: Export docker images
+        command: |
+          mkdir release_archive
+          docker save $URI-$ARCH | zstd > release_archive/release_$ARCH.tar.zst
+    - persist_to_workspace:
+        root: .
+        paths: release_archive
     - store_artifacts:
         path: envoy
   merge_docker:
@@ -99,13 +113,33 @@ jobs:
         command: |
           echo 'export REPOSITORY=mesg/istio/proxyv2' >> $BASH_ENV
           echo 'export URI=$ECR_HOST/$REPOSITORY:$CIRCLE_TAG' >> $BASH_ENV
+    - attach_workspace:
+        at: /tmp/workspace
     - run:
         name: Build docker image
         command: |
-          docker pull $URI-amd64
-          docker pull $URI-arm64
-          docker manifest create $URI $URI-amd64 $URI-arm64
-          docker manifest push $URI
+          set +e
+          docker manifest inspect $URI > /dev/null
+          if [ $? -eq 0 ]; then
+            echo "ECR already has an image for $URI. Skipping build since registry is immutable."
+          else
+            docker manifest inspect $URI-amd64 > /dev/null
+            if [ $? -ne 0 ]; then
+              zstdcat /tmp/workspace/release_archive/release_amd64.tar.zst | docker load
+              docker push $URI-amd64
+            fi
+
+            docker manifest inspect $URI-arm64 > /dev/null
+            if [ $? -ne 0 ]; then
+              zstdcat /tmp/workspace/release_archive/release_arm64.tar.zst | docker load
+              docker push $URI-arm64
+            fi
+
+            docker pull $URI-amd64
+            docker pull $URI-arm64
+            docker manifest create $URI $URI-amd64 $URI-arm64
+            docker manifest push $URI
+          fi
 
 commands:
   aws-setup:
@@ -120,6 +154,8 @@ commands:
           fi
           mkdir -p ~/.docker
           echo '{ "credsStore": "ecr-login" }' > ~/.docker/config.json
+
+          sudo apt install -y zstd
     - run:
         name: Setup AWS credentials
         command: |
