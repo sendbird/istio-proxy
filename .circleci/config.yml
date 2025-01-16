@@ -1,0 +1,188 @@
+version: 2.1
+
+orbs:
+  aws-ecr: circleci/aws-ecr@8.1.3
+  aws-cli: circleci/aws-cli@5.1.1
+
+workflows:
+  build:
+    jobs:
+    - build:
+        name: build_arm64
+        filters:
+          tags:
+            only:
+            - /^v.*/
+          branches:
+            ignore:
+            - /.*/
+        context: circleci-soda-bot
+        machine-type: arm64
+    - build:
+        name: build_x64
+        filters:
+          tags:
+            only:
+            - /^v.*/
+          branches:
+            ignore:
+            - /.*/
+        context: circleci-soda-bot
+        machine-type: amd64
+    - merge_docker:
+        filters:
+          tags:
+            only:
+            - /^v.*/
+          branches:
+            ignore:
+            - /.*/
+        context: circleci-soda-bot
+        requires:
+        - build_arm64
+        - build_x64
+
+executors:
+  arm64:
+    machine:
+      resource_class: arm.2xlarge
+      image: ubuntu-2204:current
+  amd64:
+    machine:
+      resource_class: 2xlarge
+      image: ubuntu-2204:current
+
+jobs:
+  build:
+    parameters:
+      machine-type:
+        type: executor
+    executor: << parameters.machine-type >>
+
+    steps:
+    - checkout
+    - aws-setup
+    - run:
+        name: Set environment
+        command: |
+          echo 'export REPOSITORY=mesg/istio/proxyv2' >> $BASH_ENV
+          echo 'export URI=$ECR_HOST/$REPOSITORY:$CIRCLE_TAG' >> $BASH_ENV
+          if  [ "$(uname -m)" = "x86_64" ]; then
+            ARCH=amd64
+          else
+            ARCH=arm64
+          fi
+          echo "export ARCH=$ARCH" >> $BASH_ENV
+    - run:
+        name: build
+        command: |
+          set +e
+          docker manifest inspect $URI-$ARCH > /dev/null
+          if [ $? -eq 0 ]; then
+            echo "ECR already has an image for $URI. Skipping build since registry is immutable."
+            circleci-agent step halt
+          else
+            BUILD_WITH_CONTAINER=1 make build_envoy
+          fi
+    - run:
+        name: Extract build output
+        command: |
+          common/scripts/run.sh cp /work/bazel-bin/envoy .
+          mkdir $ARCH
+          cp envoy $ARCH/
+
+          docker build -t $URI-$ARCH .
+    - run:
+        name: Export docker images
+        command: |
+          mkdir release_archive
+          docker save $URI-$ARCH | zstd > release_archive/release_$ARCH.tar.zst
+    - persist_to_workspace:
+        root: .
+        paths: release_archive
+    - store_artifacts:
+        path: envoy
+  merge_docker:
+    machine:
+      image: ubuntu-2204:current
+    steps:
+    - aws-setup
+    - checkout
+    - run:
+        name: Set environment
+        command: |
+          echo 'export REPOSITORY=mesg/istio/proxyv2' >> $BASH_ENV
+          echo 'export URI=$ECR_HOST/$REPOSITORY:$CIRCLE_TAG' >> $BASH_ENV
+    - attach_workspace:
+        at: /tmp/workspace
+    - run:
+        name: Build docker image
+        command: |
+          set +e
+          docker manifest inspect $URI > /dev/null
+          if [ $? -eq 0 ]; then
+            echo "ECR already has an image for $URI. Skipping build since registry is immutable."
+          else
+            docker manifest inspect $URI-amd64 > /dev/null
+            if [ $? -ne 0 ]; then
+              zstdcat /tmp/workspace/release_archive/release_amd64.tar.zst | docker load
+              docker push $URI-amd64
+            fi
+
+            docker manifest inspect $URI-arm64 > /dev/null
+            if [ $? -ne 0 ]; then
+              zstdcat /tmp/workspace/release_archive/release_arm64.tar.zst | docker load
+              docker push $URI-arm64
+            fi
+
+            docker pull $URI-amd64
+            docker pull $URI-arm64
+            docker manifest create $URI $URI-amd64 $URI-arm64
+            docker manifest push $URI
+          fi
+
+commands:
+  aws-setup:
+    steps:
+    - run:
+        name: Install aws-ecr-credential-helper
+        command: |
+          if [ -n "$(which docker-credential-ecr-login)" ]; then
+            echo "aws-ecr-credential-helper already installed"
+          else
+            sudo apt update && sudo apt install amazon-ecr-credential-helper -y
+          fi
+          mkdir -p ~/.docker
+          echo '{ "credsStore": "ecr-login" }' > ~/.docker/config.json
+
+          sudo apt install -y zstd
+    - run:
+        name: Setup AWS credentials
+        command: |
+          # remove existing credentials
+          unset AWS_ACCESS_KEY_ID
+          unset AWS_SECRET_ACCESS_KEY
+          unset AWS_SESSION_TOKEN
+          unset AWS_ROLE_ARN
+          rm -rf ~/.aws/credentials
+
+          # assume role with oidc token
+          echo ${CIRCLE_OIDC_TOKEN} > /tmp/token
+          export AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/token
+          export AWS_ROLE_ARN=${AWS_ID_ROLE_ARN}
+          export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s" \
+          $(aws sts assume-role \
+          --role-arn ${AWS_OPS_ROLE_ARN} \
+          --role-session-name ${CIRCLE_JOB} \
+          --query "Credentials.[AccessKeyId,SecretAccessKey,SessionToken]" \
+          --output text))
+
+          # set aws credentials
+          echo "export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" >> $BASH_ENV
+          echo "export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" >> $BASH_ENV
+          echo "export AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}" >> $BASH_ENV
+
+          # set ecr host
+          echo 'export AWS_REGION=us-east-1' >> $BASH_ENV
+          echo 'export ECR_ACCOUNT_NUM=$(echo ${AWS_OPS_ROLE_ARN} | grep -Eo "[0-9]{12}")' >> $BASH_ENV
+          echo 'export ECR_HOST=${ECR_ACCOUNT_NUM}.dkr.ecr.${AWS_REGION}.amazonaws.com' >> $BASH_ENV
