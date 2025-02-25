@@ -82,7 +82,7 @@ jobs:
             echo "ECR already has an image for $URI. Skipping build since registry is immutable."
             circleci-agent step halt
           else
-            BUILD_WITH_CONTAINER=1 make build_envoy
+            BUILD_WITH_CONTAINER=1 make build_envoy_asan
           fi
     - run:
         name: Extract build output
